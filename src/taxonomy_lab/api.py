@@ -114,6 +114,10 @@ class JsonApplication:
                     self._actor(normalized_headers), int(parts[1]), payload["reason"]
                 )
                 return Response(200, result)
+            if method == "GET" and len(parts) == 3 and parts[0] == "evidence_items" and parts[2] == "exclusion":
+                return Response(
+                    200, self.service.get_exclusion(self._actor(normalized_headers), int(parts[1]))
+                )
             if method == "POST" and path == "/jobs/claim":
                 result = self.service.claim_job(payload["worker_id"], int(payload.get("lease_seconds", 60)))
                 return Response(200, {"job": result})

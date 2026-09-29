@@ -16,6 +16,12 @@ class Conflict(ServiceError):
     status = 409
 
 
+class ExclusionAlreadyDecided(Conflict):
+    """排除申请已有终局决定，迟到的另一结论不能再生效。"""
+
+    code = "exclusion_already_decided"
+
+
 class Forbidden(ServiceError):
     code = "forbidden"
     status = 403

@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -95,13 +95,16 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
 CREATE TABLE IF NOT EXISTS exclusion_requests (
     exclusion_id INTEGER PRIMARY KEY AUTOINCREMENT,
     evidence_item_id INTEGER NOT NULL REFERENCES evidence_items(evidence_item_id),
+    round_version INTEGER NOT NULL DEFAULT 1 CHECK (round_version > 0),
     status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'revoked')),
     reason TEXT NOT NULL,
     requested_by TEXT NOT NULL REFERENCES users(user_id),
     requested_at TEXT NOT NULL,
     reviewed_by TEXT REFERENCES users(user_id),
     reviewed_at TEXT,
-    review_note TEXT
+    review_note TEXT,
+    review_request_sha256 TEXT CHECK (review_request_sha256 IS NULL OR length(review_request_sha256) = 64),
+    UNIQUE (evidence_item_id, round_version)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS one_open_exclusion_per_evidence_item
@@ -190,11 +193,40 @@ def transaction(connection: sqlite3.Connection, *, immediate: bool = False) -> I
         connection.commit()
 
 
+def _migrate(connection: sqlite3.Connection) -> None:
+    """为旧版数据库补齐终局复核所需的列与索引。"""
+
+    columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(exclusion_requests)").fetchall()
+    }
+    if not columns or "round_version" in columns:
+        return
+    connection.execute(
+        "ALTER TABLE exclusion_requests ADD COLUMN round_version INTEGER NOT NULL DEFAULT 1"
+    )
+    connection.execute(
+        "ALTER TABLE exclusion_requests ADD COLUMN review_request_sha256 TEXT"
+    )
+    # 旧库同一观察记录可能已有多条已关闭申请，按时间顺序回填轮次号。
+    connection.execute(
+        "UPDATE exclusion_requests SET round_version=("
+        "SELECT count(*) FROM exclusion_requests predecessor "
+        "WHERE predecessor.evidence_item_id=exclusion_requests.evidence_item_id "
+        "AND predecessor.exclusion_id<=exclusion_requests.exclusion_id)"
+    )
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS exclusion_round_unique "
+        "ON exclusion_requests(evidence_item_id, round_version)"
+    )
+
+
 def initialize(connection: sqlite3.Connection) -> None:
     """初始化基础资料表，重复执行不改变已有数据。"""
 
     connection.executescript(SCHEMA_SQL)
     with transaction(connection, immediate=True):
+        _migrate(connection)
         connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

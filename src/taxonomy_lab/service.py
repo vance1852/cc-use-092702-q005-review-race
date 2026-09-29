@@ -11,7 +11,7 @@ from typing import Any, Iterable, Mapping
 from .analysis import ALGORITHM_VERSION, analyze
 from .clock import SystemClock, isoformat
 from .contracts import EvidenceItem, EvidenceProtocol, ValidationError
-from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
+from .errors import Conflict, ExclusionAlreadyDecided, Forbidden, InvalidState, NotFound, ValidationFailed
 from .jsonio import canonical_json, content_digest
 from .storage import initialize, transaction
 
@@ -269,57 +269,110 @@ class TaxonomyLabService:
             raise NotFound("观察记录不存在")
         try:
             with transaction(self.connection, immediate=True):
+                latest = self.connection.execute(
+                    "SELECT round_version,status FROM exclusion_requests WHERE evidence_item_id=? "
+                    "ORDER BY round_version DESC LIMIT 1",
+                    (evidence_item_id,),
+                ).fetchone()
+                if latest is not None and latest["status"] in {"pending", "approved"}:
+                    raise Conflict("该观察记录已有待处理或生效排除")
+                round_version = 1 if latest is None else latest["round_version"] + 1
                 cursor = self.connection.execute(
-                    "INSERT INTO exclusion_requests(evidence_item_id,status,reason,requested_by,requested_at) "
-                    "VALUES(?,?,?,?,?)",
-                    (evidence_item_id, "pending", reason, actor_id, self._now()),
+                    "INSERT INTO exclusion_requests"
+                    "(evidence_item_id,round_version,status,reason,requested_by,requested_at) "
+                    "VALUES(?,?, 'pending',?,?,?)",
+                    (evidence_item_id, round_version, reason, actor_id, self._now()),
                 )
                 exclusion_id = cursor.lastrowid
-                self._audit("evidence_item", str(evidence_item_id), "exclusion.requested", actor_id, {"reason": reason})
+                self._audit(
+                    "evidence_item",
+                    str(evidence_item_id),
+                    "exclusion.requested",
+                    actor_id,
+                    {"exclusion_id": exclusion_id, "round_version": round_version, "reason": reason},
+                )
         except sqlite3.IntegrityError as exc:
             raise Conflict("该观察记录已有待处理或生效排除") from exc
-        return {"exclusion_id": exclusion_id, "status": "pending"}
+        return {"exclusion_id": exclusion_id, "round_version": round_version, "status": "pending"}
 
     def review_exclusion(
         self, actor_id: str, exclusion_id: int, approve: bool, note: str
     ) -> dict[str, Any]:
         self._require(actor_id, "exclusion.review")
-        row = self.connection.execute(
-            "SELECT * FROM exclusion_requests WHERE exclusion_id=?", (exclusion_id,)
-        ).fetchone()
-        if row is None:
-            raise NotFound("排除申请不存在")
-        if row["status"] != "pending":
-            raise InvalidState("排除申请已经处理")
-        if row["requested_by"] == actor_id:
-            raise Forbidden("申请人不能复核自己的排除申请")
         status = "approved" if approve else "rejected"
+        request_digest = content_digest(
+            [{"exclusion_id": exclusion_id, "approve": approve, "note": note}]
+        )
+        # 读取、判定与写入必须在同一个 IMMEDIATE 事务内完成：事务持锁期间看到的
+        # pending 状态与受条件保护的更新共同保证只有一个决定能够落库。
         with transaction(self.connection, immediate=True):
-            self.connection.execute(
-                "UPDATE exclusion_requests SET status=?,reviewed_by=?,reviewed_at=?,review_note=? "
+            row = self.connection.execute(
+                "SELECT * FROM exclusion_requests WHERE exclusion_id=?", (exclusion_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound("排除申请不存在")
+            if row["status"] != "pending":
+                if row["review_request_sha256"] == request_digest:
+                    # 同内容的再次提交：原决定唯一有效，直接返回而不写第二条终局。
+                    return {
+                        "exclusion_id": exclusion_id,
+                        "round_version": row["round_version"],
+                        "status": row["status"],
+                        "reviewed_by": row["reviewed_by"],
+                        "replayed": True,
+                    }
+                raise ExclusionAlreadyDecided(
+                    f"排除申请已有终局决定 {row['status']}，迟到的 {status} 请求不再生效"
+                )
+            if row["requested_by"] == actor_id:
+                raise Forbidden("申请人不能复核自己的排除申请")
+            cursor = self.connection.execute(
+                "UPDATE exclusion_requests "
+                "SET status=?,reviewed_by=?,reviewed_at=?,review_note=?,review_request_sha256=? "
                 "WHERE exclusion_id=? AND status='pending'",
-                (status, actor_id, self._now(), note, exclusion_id),
+                (status, actor_id, self._now(), note, request_digest, exclusion_id),
             )
-            self._audit("exclusion", str(exclusion_id), f"exclusion.{status}", actor_id, {"note": note})
-        return {"exclusion_id": exclusion_id, "status": status}
+            if cursor.rowcount != 1:
+                # 竞争失败：另一个决定已在本事务持锁期间取得终局，本次调用不留任何痕迹。
+                raise ExclusionAlreadyDecided(
+                    f"排除申请的终局决定已由其他复核给出，{status} 请求不再生效"
+                )
+            self._audit(
+                "exclusion",
+                str(exclusion_id),
+                f"exclusion.{status}",
+                actor_id,
+                {
+                    "evidence_item_id": row["evidence_item_id"],
+                    "round_version": row["round_version"],
+                    "note": note,
+                },
+            )
+        return {
+            "exclusion_id": exclusion_id,
+            "round_version": row["round_version"],
+            "status": status,
+            "reviewed_by": actor_id,
+            "replayed": False,
+        }
 
     def revoke_exclusion(self, actor_id: str, exclusion_id: int, reason: str) -> dict[str, Any]:
         self._require(actor_id, "exclusion.revoke")
-        row = self.connection.execute(
-            "SELECT e.*,o.batch_id FROM exclusion_requests e "
-            "JOIN evidence_items o ON o.evidence_item_id=e.evidence_item_id WHERE e.exclusion_id=?",
-            (exclusion_id,),
-        ).fetchone()
-        if row is None:
-            raise NotFound("排除记录不存在")
-        if row["status"] != "approved":
-            raise InvalidState("只有已批准的排除可以撤销")
-        if row["requested_by"] != actor_id:
-            raise Forbidden("只有原申请人可以撤销排除")
-        batch = self.get_batch(row["batch_id"])
-        if batch["state"] != "running":
-            raise InvalidState("批次封存后不能改变排除状态")
         with transaction(self.connection, immediate=True):
+            row = self.connection.execute(
+                "SELECT e.*,o.batch_id FROM exclusion_requests e "
+                "JOIN evidence_items o ON o.evidence_item_id=e.evidence_item_id WHERE e.exclusion_id=?",
+                (exclusion_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFound("排除记录不存在")
+            if row["status"] != "approved":
+                raise InvalidState("只有已批准的排除可以撤销")
+            if row["requested_by"] != actor_id:
+                raise Forbidden("只有原申请人可以撤销排除")
+            batch = self.get_batch(row["batch_id"])
+            if batch["state"] != "running":
+                raise InvalidState("批次封存后不能改变排除状态")
             cursor = self.connection.execute(
                 "UPDATE exclusion_requests SET status='revoked',review_note=?,reviewed_at=? "
                 "WHERE exclusion_id=? AND status='approved'",
@@ -332,9 +385,48 @@ class TaxonomyLabService:
                 str(row["evidence_item_id"]),
                 "exclusion.revoked",
                 actor_id,
-                {"exclusion_id": exclusion_id, "reason": reason},
+                {"exclusion_id": exclusion_id, "round_version": row["round_version"], "reason": reason},
             )
-        return {"exclusion_id": exclusion_id, "status": "revoked"}
+        return {"exclusion_id": exclusion_id, "round_version": row["round_version"], "status": "revoked"}
+
+    @staticmethod
+    def _exclusion_history(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "exclusion_id": row["exclusion_id"],
+            "evidence_item_id": row["evidence_item_id"],
+            "round_version": row["round_version"],
+            "status": row["status"],
+            "reason": row["reason"],
+            "requested_by": row["requested_by"],
+            "requested_at": row["requested_at"],
+            "reviewed_by": row["reviewed_by"],
+            "reviewed_at": row["reviewed_at"],
+            "review_note": row["review_note"],
+        }
+
+    def get_exclusion(self, actor_id: str, evidence_item_id: int) -> dict[str, Any]:
+        """区分有效决定、版本、操作者与完整历史的终局查询。"""
+
+        user = self._user(actor_id)
+        if user["role"] not in {"operator", "statistician", "approver", "auditor"}:
+            raise Forbidden("当前角色不能查询排除记录")
+        evidence_item = self.connection.execute(
+            "SELECT evidence_item_id FROM evidence_items WHERE evidence_item_id=?", (evidence_item_id,)
+        ).fetchone()
+        if evidence_item is None:
+            raise NotFound("观察记录不存在")
+        rows = self.connection.execute(
+            "SELECT * FROM exclusion_requests WHERE evidence_item_id=? ORDER BY round_version, exclusion_id",
+            (evidence_item_id,),
+        ).fetchall()
+        history = [self._exclusion_history(row) for row in rows]
+        effective = history[-1] if rows and rows[-1]["status"] in {"pending", "approved"} else None
+        return {
+            "evidence_item_id": evidence_item_id,
+            "participates_in_analysis": effective is None or effective["status"] != "approved",
+            "effective": effective,
+            "history": history,
+        }
 
     def seal_batch(self, actor_id: str, batch_id: str, expected_revision: int) -> dict[str, Any]:
         self._require(actor_id, "batch.seal")
@@ -529,14 +621,30 @@ class TaxonomyLabService:
                 "SELECT * FROM decisions WHERE analysis_id=?", (analysis_row["analysis_id"],)
             ).fetchone()
         exclusions = self.connection.execute(
-            "SELECT e.exclusion_id,e.evidence_item_id,e.status,e.reason,e.requested_by,e.reviewed_by "
+            "SELECT e.* "
             "FROM exclusion_requests e JOIN evidence_items o ON o.evidence_item_id=e.evidence_item_id "
-            "WHERE o.batch_id=? ORDER BY e.exclusion_id", (batch_id,)
+            "WHERE o.batch_id=? ORDER BY e.evidence_item_id,e.round_version,e.exclusion_id",
+            (batch_id,),
         ).fetchall()
+        exclusion_history = [self._exclusion_history(row) for row in exclusions]
+        effective_by_item: dict[int, dict[str, Any]] = {}
+        for record in exclusion_history:
+            if record["status"] in {"pending", "approved"}:
+                effective_by_item[record["evidence_item_id"]] = record
+        # 审计事件与样本参与状态必须取自同一套终局：批次事件、各观察记录与各排除轮次
+        # 的事件合并为完整链路，避免审计侧看不到决定样本是否参与分析的排除事件。
         events = self.connection.execute(
-            "SELECT event_type,actor_id,payload_json,created_at FROM audit_events "
-            "WHERE entity_type='batch' AND entity_id=? "
-            "ORDER BY event_id", (batch_id,)
+            "SELECT event_type,entity_type,entity_id,actor_id,payload_json,created_at FROM audit_events "
+            "WHERE (entity_type='batch' AND entity_id=?) "
+            "OR entity_id IN ("
+            "SELECT e.exclusion_id FROM exclusion_requests e "
+            "JOIN evidence_items o ON o.evidence_item_id=e.evidence_item_id WHERE o.batch_id=?"
+            ") "
+            "OR (entity_type='evidence_item' AND entity_id IN ("
+            "SELECT CAST(o.evidence_item_id AS TEXT) FROM evidence_items o WHERE o.batch_id=?"
+            ")) "
+            "ORDER BY event_id",
+            (batch_id, batch_id, batch_id),
         ).fetchall()
         return {
             "batch": batch,
@@ -555,6 +663,9 @@ class TaxonomyLabService:
                 "result": json.loads(analysis_row["result_json"]),
             },
             "decision": None if decision_row is None else dict(decision_row),
-            "exclusions": [dict(row) for row in exclusions],
+            "exclusions": exclusion_history,
+            "effective_exclusions": sorted(
+                effective_by_item.values(), key=lambda record: record["evidence_item_id"]
+            ),
             "events": [dict(row) | {"payload": json.loads(row["payload_json"])} for row in events],
         }
