@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -95,18 +95,34 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
 CREATE TABLE IF NOT EXISTS exclusion_requests (
     exclusion_id INTEGER PRIMARY KEY AUTOINCREMENT,
     evidence_item_id INTEGER NOT NULL REFERENCES evidence_items(evidence_item_id),
+    attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
     status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'revoked')),
     reason TEXT NOT NULL,
     requested_by TEXT NOT NULL REFERENCES users(user_id),
     requested_at TEXT NOT NULL,
-    reviewed_by TEXT REFERENCES users(user_id),
-    reviewed_at TEXT,
-    review_note TEXT
+    revoked_by TEXT REFERENCES users(user_id),
+    revoked_at TEXT,
+    revoke_reason TEXT,
+    UNIQUE (evidence_item_id, attempt_no)
 );
 
+-- 同一观察记录至多存在一条“待复核”或“已生效”的排除申请；
+-- 驳回或撤销之后才允许按递增的 attempt_no 重新申请。
 CREATE UNIQUE INDEX IF NOT EXISTS one_open_exclusion_per_evidence_item
 ON exclusion_requests(evidence_item_id)
 WHERE status IN ('pending', 'approved');
+
+-- 终局复核决定独立成表：UNIQUE(exclusion_id) 在数据库层保证每条申请
+-- 至多有一个终局决定，从根上消除“批准/驳回双终局”。
+CREATE TABLE IF NOT EXISTS exclusion_decisions (
+    decision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    exclusion_id INTEGER NOT NULL REFERENCES exclusion_requests(exclusion_id),
+    decision TEXT NOT NULL CHECK (decision IN ('approved', 'rejected')),
+    note TEXT NOT NULL DEFAULT '',
+    decided_by TEXT NOT NULL REFERENCES users(user_id),
+    decided_at TEXT NOT NULL,
+    UNIQUE (exclusion_id)
+);
 
 CREATE TABLE IF NOT EXISTS analysis_jobs (
     job_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -161,8 +177,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
 
 REQUIRED_TABLES = frozenset({
     "schema_meta", "evidence_protocol_catalog", "users", "capture_devices", "builds", "batches",
-    "evidence_items", "idempotency_keys", "exclusion_requests", "analysis_jobs",
-    "analyses", "decisions", "audit_events",
+    "evidence_items", "idempotency_keys", "exclusion_requests", "exclusion_decisions",
+    "analysis_jobs", "analyses", "decisions", "audit_events",
 })
 
 
@@ -190,9 +206,89 @@ def transaction(connection: sqlite3.Connection, *, immediate: bool = False) -> I
         connection.commit()
 
 
+def _column_names(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate_legacy_exclusions(connection: sqlite3.Connection) -> None:
+    """把 v2 的单表复核结构迁移到 v3 的申请/终局双表。"""
+
+    exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='exclusion_requests'"
+    ).fetchone()
+    if exists is None or "attempt_no" in _column_names(connection, "exclusion_requests"):
+        return  # 全新库或已是新结构
+    with transaction(connection, immediate=True):
+        connection.execute("ALTER TABLE exclusion_requests RENAME TO exclusion_requests_v2")
+        # 旧的同名部分唯一索引仍挂在 v2 表上；删除后由 SCHEMA_SQL 在新表重建。
+        connection.execute("DROP INDEX IF EXISTS one_open_exclusion_per_evidence_item")
+        connection.execute(
+            """
+CREATE TABLE exclusion_requests (
+    exclusion_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    evidence_item_id INTEGER NOT NULL REFERENCES evidence_items(evidence_item_id),
+    attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'revoked')),
+    reason TEXT NOT NULL,
+    requested_by TEXT NOT NULL REFERENCES users(user_id),
+    requested_at TEXT NOT NULL,
+    revoked_by TEXT REFERENCES users(user_id),
+    revoked_at TEXT,
+    revoke_reason TEXT,
+    UNIQUE (evidence_item_id, attempt_no)
+)
+"""
+        )
+        connection.execute(
+            """
+INSERT INTO exclusion_requests(
+    exclusion_id,evidence_item_id,attempt_no,status,reason,requested_by,requested_at,
+    revoked_by,revoked_at,revoke_reason
+)
+SELECT exclusion_id,evidence_item_id,
+       ROW_NUMBER() OVER (PARTITION BY evidence_item_id ORDER BY exclusion_id),
+       status,reason,requested_by,requested_at,
+       CASE WHEN status='revoked' THEN requested_by ELSE NULL END,
+       CASE WHEN status='revoked' THEN reviewed_at ELSE NULL END,
+       CASE WHEN status='revoked' THEN review_note ELSE NULL END
+FROM exclusion_requests_v2
+"""
+        )
+        connection.execute(
+            """
+CREATE TABLE exclusion_decisions (
+    decision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    exclusion_id INTEGER NOT NULL REFERENCES exclusion_requests(exclusion_id),
+    decision TEXT NOT NULL CHECK (decision IN ('approved', 'rejected')),
+    note TEXT NOT NULL DEFAULT '',
+    decided_by TEXT NOT NULL REFERENCES users(user_id),
+    decided_at TEXT NOT NULL,
+    UNIQUE (exclusion_id)
+)
+"""
+        )
+        # revoked 在旧结构中表示“曾批准、后撤销”：其历史终局为 approved，
+        # 批准人仍是 reviewed_by（旧撤销流程不覆盖该列）；批准备注已被撤销原因
+        # 覆盖而无法恢复，故留空，撤销原因已单独存入 revoke_reason。
+        connection.execute(
+            """
+INSERT INTO exclusion_decisions(exclusion_id,decision,note,decided_by,decided_at)
+SELECT exclusion_id,
+       CASE WHEN status='rejected' THEN 'rejected' ELSE 'approved' END,
+       CASE WHEN status='revoked' THEN '' ELSE COALESCE(review_note,'') END,
+       reviewed_by,
+       reviewed_at
+FROM exclusion_requests_v2
+WHERE status IN ('approved','rejected','revoked') AND reviewed_by IS NOT NULL
+"""
+        )
+        connection.execute("DROP TABLE exclusion_requests_v2")
+
+
 def initialize(connection: sqlite3.Connection) -> None:
     """初始化基础资料表，重复执行不改变已有数据。"""
 
+    _migrate_legacy_exclusions(connection)
     connection.executescript(SCHEMA_SQL)
     with transaction(connection, immediate=True):
         connection.execute(
